@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"math/rand"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -46,61 +47,6 @@ func (st StateType) String() string {
 // so that the proposer can be notified and fail fast.
 var ErrProposalDropped = errors.New("raft proposal dropped")
 
-// Config contains the parameters to start a raft.
-type Config struct {
-	// ID is the identity of the local raft. ID cannot be 0.
-	ID uint64
-
-	// peers contains the IDs of all nodes (including self) in the raft cluster. It
-	// should only be set when starting a new raft cluster. Restarting raft from
-	// previous configuration will panic if peers is set. peer is private and only
-	// used for testing right now.
-	peers []uint64
-
-	// ElectionTick is the number of Node.Tick invocations that must pass between
-	// elections. That is, if a follower does not receive any message from the
-	// leader of current term before ElectionTick has elapsed, it will become
-	// candidate and start an election. ElectionTick must be greater than
-	// HeartbeatTick. We suggest ElectionTick = 10 * HeartbeatTick to avoid
-	// unnecessary leader switching.
-	ElectionTick int
-	// HeartbeatTick is the number of Node.Tick invocations that must pass between
-	// heartbeats. That is, a leader sends heartbeat messages to maintain its
-	// leadership every HeartbeatTick ticks.
-	HeartbeatTick int
-
-	// Storage is the storage for raft. raft generates entries and states to be
-	// stored in storage. raft reads the persisted entries and states out of
-	// Storage when it needs. raft reads out the previous state and configuration
-	// out of storage when restarting.
-	Storage Storage
-	// Applied is the last applied index. It should only be set when restarting
-	// raft. raft will not return entries to the application smaller or equal to
-	// Applied. If Applied is unset when restarting, raft might return previous
-	// applied entries. This is a very application dependent configuration.
-	Applied uint64
-}
-
-func (c *Config) validate() error {
-	if c.ID == None {
-		return errors.New("cannot use none as id")
-	}
-
-	if c.HeartbeatTick <= 0 {
-		return errors.New("heartbeat tick must be greater than 0")
-	}
-
-	if c.ElectionTick <= c.HeartbeatTick {
-		return errors.New("election tick must be greater than heartbeat tick")
-	}
-
-	if c.Storage == nil {
-		return errors.New("storage cannot be nil")
-	}
-
-	return nil
-}
-
 // Progress represents a follower’s progress in the view of the leader. Leader maintains
 // progresses of all followers, and sends entries to the follower based on its progress.
 type Progress struct {
@@ -115,6 +61,8 @@ type Raft struct {
 
 	// the log
 	RaftLog *RaftLog
+
+	peers []uint64
 
 	// log replication progress of each peers
 	Prs map[uint64]*Progress
@@ -142,6 +90,8 @@ type Raft struct {
 	// Number of ticks since it reached last electionTimeout or received a
 	// valid message from current leader when it is a follower.
 	electionElapsed int
+	// electionTimeSeed is used to generate electionTimeout.
+	electionTimeSeed int
 
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in section 3.10 of Raft phd thesis.
@@ -164,8 +114,35 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
-	// Your Code Here (2A).
-	return nil
+
+	// peersCopy is peers after remove current node.
+	peersCopy := make([]uint64, 0, len(c.peers)-1)
+	for _, peer := range c.peers {
+		if peer == c.ID {
+			continue
+		}
+
+		peersCopy = append(peersCopy, peer)
+	}
+
+	// generate election timeout by given election seed.
+	electionTimeout := c.ElectionTick + rand.Intn(c.ElectionTick)
+
+	raft := &Raft{
+		id:    c.ID,
+		peers: peersCopy,
+
+		electionTimeSeed: c.ElectionTick,
+		electionTimeout:  electionTimeout,
+		heartbeatTimeout: c.HeartbeatTick,
+
+		Prs:   map[uint64]*Progress{},
+		votes: map[uint64]bool{},
+	}
+
+	raft.becomeFollower(0, None)
+
+	return raft
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -175,42 +152,88 @@ func (r *Raft) sendAppend(to uint64) bool {
 	return false
 }
 
-// sendHeartbeat sends a heartbeat RPC to the given peer.
-func (r *Raft) sendHeartbeat(to uint64) {
-	// Your Code Here (2A).
-}
-
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
-	// Your Code Here (2A).
+	if r.State == StateLeader {
+		r.leaderTick()
+	} else {
+		r.normalTick()
+	}
 }
 
-// becomeFollower transform this peer's state to Follower
-func (r *Raft) becomeFollower(term uint64, lead uint64) {
-	// Your Code Here (2A).
-}
+// normalTick is tick for Follower|Candidate.
+func (r *Raft) normalTick() {
+	r.electionElapsed++
 
-// becomeCandidate transform this peer's state to candidate
-func (r *Raft) becomeCandidate() {
-	// Your Code Here (2A).
-}
+	if r.electionTimeout == r.electionElapsed {
+		r.electionElapsed = 0
+		r.electionTimeout = r.electionTimeSeed + rand.Intn(r.electionTimeSeed)
 
-// becomeLeader transform this peer's state to leader
-func (r *Raft) becomeLeader() {
-	// Your Code Here (2A).
-	// NOTE: Leader should propose a noop entry on its term
+		r.doElection()
+	}
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
-	// Your Code Here (2A).
+	if m.Term > r.Term {
+		if isMessageFromLeader(m) {
+			r.becomeFollower(m.Term, m.From)
+		} else {
+			r.becomeFollower(m.Term, None)
+		}
+	}
+
 	switch r.State {
 	case StateFollower:
+		return r.stepFollower(m)
 	case StateCandidate:
+		return r.stepCandidate(m)
 	case StateLeader:
+		return r.stepLeader(m)
+	default:
+		return errors.New("raft state error")
 	}
-	return nil
+}
+
+// handleVoteRequest raft status may be Follower|Candidate|Leader when called.
+func (r *Raft) handleVoteRequest(m pb.Message) {
+	if m.Term < r.Term {
+		r.sendRejectVoteResponse(m.From)
+		return
+	}
+
+	if m.Term == r.Term && r.Vote != None && r.Vote != m.From {
+		r.sendRejectVoteResponse(m.From)
+		return
+	}
+
+	r.Vote = m.From
+	r.sendAcceptVoteResponse(m.From)
+}
+
+// sendAcceptVoteResponse send accept VoteResposne to toID.
+func (r *Raft) sendAcceptVoteResponse(toID uint64) {
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgRequestVoteResponse,
+		From:    r.id,
+		Term:    r.Term,
+		To:      toID,
+
+		Reject: false,
+	})
+}
+
+// sendRejectVoteResponse send reject VoteResposne to toID.
+func (r *Raft) sendRejectVoteResponse(toID uint64) {
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgRequestVoteResponse,
+		From:    r.id,
+		Term:    r.Term,
+		To:      toID,
+
+		Reject: true,
+	})
 }
 
 // handleAppendEntries handle AppendEntries RPC request
